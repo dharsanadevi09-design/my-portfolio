@@ -1,3 +1,5 @@
+console.log("STEP 1 - Server file loaded");
+
 import dns from "dns";
 dns.setDefaultResultOrder("ipv4first");
 
@@ -5,11 +7,10 @@ import express from "express";
 import path from "path";
 import nodemailer from "nodemailer";
 import dotenv from "dotenv";
-import mysql from "mysql2/promise";
+import mysql, { Pool } from "mysql2/promise";
 import { createServer as createViteServer } from "vite";
 import { initialPortfolioData } from "./src/initialData";
 
-// Load environment variables
 dotenv.config();
 
 const app = express();
@@ -17,34 +18,26 @@ const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json());
 
-// --- MYSQL CONNECTION SETUP ---
-let db: mysql.Pool;
+let db: Pool;
 
+// --- DATABASE INITIALIZATION ---
 async function initDb() {
   try {
-    // 1. First, connect without a database to ensure the database exists
-    const connection = await mysql.createConnection({
-      host: process.env.DB_HOST || "localhost",
-      user: process.env.DB_USER || "root",
-      password: process.env.DB_PASSWORD,
-    });
-
-    const dbName = process.env.DB_NAME || "portfolio_db";
-    await connection.query(`CREATE DATABASE IF NOT EXISTS \`${dbName}\`;`);
-    await connection.end();
-
-    // 2. Now connect to the actual database pool
     db = mysql.createPool({
-      host: process.env.DB_HOST || "localhost",
-      user: process.env.DB_USER || "root",
-      password: process.env.DB_PASSWORD,
-      database: dbName,
+      host: process.env.MYSQLHOST,
+      user: process.env.MYSQLUSER,
+      password: process.env.MYSQLPASSWORD,
+      database: process.env.MYSQLDATABASE,
+      port: Number(process.env.MYSQLPORT),
       waitForConnections: true,
       connectionLimit: 10,
       queueLimit: 0,
+      connectTimeout: 60000,
     });
 
-    // 3. Create Portfolio Table
+    await db.query("SELECT 1");
+
+    // Portfolio Table
     await db.query(`
       CREATE TABLE IF NOT EXISTS portfolio (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -54,197 +47,205 @@ async function initDb() {
       )
     `);
 
-    // 4. Create Messages Table
+    // Messages & Transactions Table
     await db.query(`
       CREATE TABLE IF NOT EXISTS messages (
         id VARCHAR(100) PRIMARY KEY,
-        senderName VARCHAR(255) NOT NULL,
-        senderEmail VARCHAR(255) NOT NULL,
+        senderName VARCHAR(255),
+        senderEmail VARCHAR(255),
         subject VARCHAR(255),
-        message TEXT NOT NULL,
+        message TEXT,
         timestamp VARCHAR(100),
         isRead BOOLEAN DEFAULT FALSE,
         isBooking BOOLEAN DEFAULT FALSE,
-        bookingAmountPaid DECIMAL(10, 2) DEFAULT 0,
+        bookingAmountPaid DECIMAL(10,2) DEFAULT 0,
         createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
-    console.log(`🐬 MySQL Database "${dbName}" is ready and connected!`);
-  } catch (err: any) {
-    console.error("❌ MySQL Connection/Init Error:", err.message);
+    console.log("🐬 MySQL Connected Successfully");
+  } catch (error: any) {
+    console.error("❌ MySQL Connection Error:", error.message);
     process.exit(1);
   }
 }
 
-// --- API ENDPOINTS ---
+// --- API ROUTES ---
 
-/**
- * Fetch Portfolio Settings
- */
+// 1. Get Portfolio Data
 app.get("/api/portfolio", async (req, res) => {
   try {
-    const [rows]: any = await db.query("SELECT data FROM portfolio WHERE portfolio_key = 'primary'");
-    
+    const [rows]: any = await db.query("SELECT data FROM portfolio WHERE portfolio_key='primary'");
     if (rows.length === 0) {
-      const stringifiedData = JSON.stringify(initialPortfolioData);
-      await db.query("INSERT INTO portfolio (portfolio_key, data) VALUES ('primary', ?)", [stringifiedData]);
+      await db.query("INSERT INTO portfolio (portfolio_key, data) VALUES ('primary', ?)", [JSON.stringify(initialPortfolioData)]);
       return res.json({ success: true, data: initialPortfolioData });
     }
-    
-    return res.json({ success: true, data: rows[0].data });
+    res.json({ success: true, data: rows[0].data });
   } catch (error: any) {
-    console.error("Error retrieving portfolio:", error);
-    return res.status(500).json({ success: false, error: "Database lookup failed" });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-/**
- * Update Portfolio Settings
- */
+// 2. Update Portfolio Data
 app.post("/api/portfolio", async (req, res) => {
-  const { data } = req.body;
-  if (!data) return res.status(400).json({ success: false, error: "Missing data" });
-
   try {
-    const stringifiedData = JSON.stringify(data);
+    const data = JSON.stringify(req.body.data);
     await db.query(
-      "INSERT INTO portfolio (portfolio_key, data) VALUES ('primary', ?) ON DUPLICATE KEY UPDATE data = ?",
-      [stringifiedData, stringifiedData]
+      `INSERT INTO portfolio (portfolio_key, data) VALUES ('primary', ?) ON DUPLICATE KEY UPDATE data=?`,
+      [data, data]
     );
-    return res.json({ success: true, message: "Portfolio saved successfully", data });
+    res.json({ success: true });
   } catch (error: any) {
-    console.error("Error saving portfolio:", error);
-    return res.status(500).json({ success: false, error: "Database operation failed" });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-/**
- * Fetch all Messages
- */
+// 3. Get All Messages (Admin Panel)
 app.get("/api/messages", async (req, res) => {
   try {
-    const [rows]: any = await db.query("SELECT * FROM messages ORDER BY createdAt DESC");
-    return res.json({ success: true, data: rows });
-  } catch (error: any) {
-    return res.status(500).json({ success: false, error: "Could not load messages." });
+    const [rows] = await db.query("SELECT * FROM messages ORDER BY createdAt DESC");
+    res.json({ success: true, data: rows });
+  } catch {
+    res.status(500).json({ success: false });
   }
 });
 
-/**
- * Submit New Message & Send Emails (To Admin and User)
- */
+// 4. MAIN ROUTE: Handle Message & Email (User + Admin)
 app.post("/api/messages", async (req, res) => {
-  const { senderName, senderEmail, subject, message, isBooking, bookingAmountPaid } = req.body;
-
-  if (!senderName || !senderEmail || !message) {
-    return res.status(400).json({ success: false, error: "Missing required fields" });
-  }
-
-  const cleanSubject = subject || "New Portfolio Interaction";
-  const newId = "msg-" + Date.now();
-  const timestampString = new Date().toLocaleDateString() + " " + new Date().toLocaleTimeString();
-
   try {
-    // 1. Save to MySQL
+    const {
+      senderName,
+      senderEmail,
+      subject,
+      message,
+      isBooking,
+      bookingAmountPaid,
+    } = req.body;
+
+    const id = `msg-${Date.now()}`;
+    const formattedDate = new Date().toLocaleString();
+
+    // A. Store in Database
     await db.query(
-      "INSERT INTO messages (id, senderName, senderEmail, subject, message, timestamp, isBooking, bookingAmountPaid) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      [newId, senderName, senderEmail, cleanSubject, message, timestampString, !!isBooking, Number(bookingAmountPaid) || 0]
+      `INSERT INTO messages 
+      (id, senderName, senderEmail, subject, message, timestamp, isBooking, bookingAmountPaid) 
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, senderName, senderEmail, subject || "No Subject", message, formattedDate, !!isBooking, Number(bookingAmountPaid) || 0]
     );
 
-    // 2. Email Notification
-    const adminEmail = process.env.EMAIL_USER || "dharsanadevi09@gmail.com";
-    const smtpUser = process.env.EMAIL_USER;
-    const smtpPass = process.env.EMAIL_PASS;
-
-    if (smtpUser && smtpPass) {
+    // B. Send Emails
+    if (process.env.EMAIL_USER && process.env.EMAIL_PASS && process.env.ADMIN_EMAIL) {
       const transporter = nodemailer.createTransport({
         service: "gmail",
-        auth: { user: smtpUser, pass: smtpPass }
+        auth: {
+          user: process.env.EMAIL_USER,
+          pass: process.env.EMAIL_PASS,
+        },
       });
 
-      // Admin Mail
-      const adminMailOptions = {
-        from: `"${senderName}" <${smtpUser}>`,
-        to: adminEmail,
-        subject: `🔔 New Website Message: ${cleanSubject}`,
-        text: `Hello Admin,\n\nYou have a new message.\n\nFrom: ${senderName}\nEmail: ${senderEmail}\nMessage: ${message}\n\nIs Booking: ${isBooking ? 'Yes' : 'No'}\nAmount: ${bookingAmountPaid || 0}`
-      };
-
-      // User Mail
+      // 1. Email to USER (The sender)
       const userMailOptions = {
-        from: `"Dharsana Devi" <${smtpUser}>`,
+        from: `"Support" <${process.env.EMAIL_USER}>`,
         to: senderEmail,
-        subject: `Received: ${cleanSubject}`,
-        text: `Hi ${senderName},\n\nThank you for contacting me. I have received your message and will get back to you soon!\n\nBest Regards,\nDharsana Devi`
+        subject: isBooking ? "Booking Confirmation - Payment Received" : "We Received Your Message",
+        html: `
+          <div style="font-family: sans-serif; line-height: 1.5; color: #333;">
+            <h2>Hello ${senderName},</h2>
+            ${isBooking 
+              ? `<p>Thank you for your booking. We have successfully received your payment of <b>₹${bookingAmountPaid}</b>.</p>`
+              : `<p>Thank you for reaching out! We have received your message and will get back to you soon.</p>`
+            }
+            <hr />
+            <p><b>Your Message Details:</b></p>
+            <p><i>"${message}"</i></p>
+            <br />
+            <p>Regards,<br>Your Team</p>
+          </div>
+        `,
       };
 
-      await Promise.all([
-        transporter.sendMail(adminMailOptions),
-        transporter.sendMail(userMailOptions)
-      ]);
+      // 2. Email to ADMIN (You)
+      const adminMailOptions = {
+        from: `"System Alert" <${process.env.EMAIL_USER}>`,
+        to: process.env.ADMIN_EMAIL,
+        subject: isBooking ? "🚨 NEW BOOKING RECEIVED" : "📩 NEW CONTACT MESSAGE",
+        html: `
+          <div style="font-family: sans-serif; background: #f4f4f4; padding: 20px;">
+            <div style="background: white; padding: 20px; border-radius: 10px;">
+              <h2>New Submission Details</h2>
+              <p><strong>Type:</strong> ${isBooking ? "Booking/Transaction" : "General Inquiry"}</p>
+              <p><strong>Name:</strong> ${senderName}</p>
+              <p><strong>Email:</strong> ${senderEmail}</p>
+              <p><strong>Subject:</strong> ${subject || "N/A"}</p>
+              <p><strong>Message:</strong> ${message}</p>
+              ${isBooking ? `<p style="color: green; font-size: 18px;"><strong>Amount Paid: ₹${bookingAmountPaid}</strong></p>` : ""}
+              <p><strong>Time:</strong> ${formattedDate}</p>
+            </div>
+          </div>
+        `,
+      };
+
+      // Execute sending emails
+      await transporter.sendMail(userMailOptions);
+      await transporter.sendMail(adminMailOptions);
+
+      console.log(`✅ Emails sent to User (${senderEmail}) and Admin`);
+    } else {
+      console.warn("⚠️ Email ENV variables missing. Database record created but emails not sent.");
     }
 
-    return res.json({ success: true, message: "Message processed successfully", id: newId });
+    res.json({ success: true, id });
 
   } catch (error: any) {
-    console.error("Error in message submission:", error);
-    return res.status(500).json({ success: false, error: "Failed to process request" });
+    console.error("❌ Message/Email Error:", error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-/**
- * Delete Message
- */
-app.delete("/api/messages/:id", async (req, res) => {
-  const { id } = req.params;
+// 5. Mark as Read
+app.patch("/api/messages/:id/read", async (req, res) => {
   try {
-    if (id === "all") {
+    await db.query("UPDATE messages SET isRead=? WHERE id=?", [!!req.body.read, req.params.id]);
+    res.json({ success: true });
+  } catch {
+    res.status(500).json({ success: false });
+  }
+});
+
+// 6. Delete Message
+app.delete("/api/messages/:id", async (req, res) => {
+  try {
+    if (req.params.id === "all") {
       await db.query("DELETE FROM messages");
     } else {
-      await db.query("DELETE FROM messages WHERE id = ?", [id]);
+      await db.query("DELETE FROM messages WHERE id=?", [req.params.id]);
     }
-    return res.json({ success: true, message: "Deleted successfully" });
-  } catch (error: any) {
-    return res.status(500).json({ success: false, error: error.message });
+    res.json({ success: true });
+  } catch {
+    res.status(500).json({ success: false });
   }
 });
 
-/**
- * Update Message Read Status
- */
-app.patch("/api/messages/:id/read", async (req, res) => {
-  const { id } = req.params;
-  const { read } = req.body;
-  try {
-    await db.query("UPDATE messages SET isRead = ? WHERE id = ?", [!!read, id]);
-    return res.json({ success: true, message: "Read status updated" });
-  } catch (error: any) {
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// Server Initialization
+// --- SERVER STARTUP ---
 async function startServer() {
-  await initDb();
+  try {
+    await initDb();
 
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
+    if (process.env.NODE_ENV !== "production") {
+      const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
+      app.use(vite.middlewares);
+    } else {
+      const distPath = path.join(process.cwd(), "dist");
+      app.use(express.static(distPath));
+      app.get("*", (req, res) => res.sendFile(path.join(distPath, "index.html")));
+    }
+
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`🚀 Server running on port ${PORT}`);
     });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
+  } catch (error) {
+    console.error("SERVER START ERROR:", error);
   }
-
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`🚀 Server is active on port ${PORT}`);
-  });
 }
 
 startServer();
